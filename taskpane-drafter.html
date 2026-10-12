@@ -20,6 +20,7 @@
   <form id="signin" hidden>
     <label>Email <input id="email" type="email" autocomplete="username" required></label>
     <label>Jarvis password <input id="password" type="password" autocomplete="current-password" required></label>
+    <label><input id="remember" type="checkbox" checked style="display:inline;width:auto"> Keep me signed in on this computer</label>
     <button id="login" type="submit">Sign in to Jarvis</button>
   </form>
   <section id="actions" hidden>
@@ -106,21 +107,34 @@ const config = Object.freeze({
   publishableKey: 'sb_publishable_-BGpcrYmK9rf4ur75FHPVA_oVhrKUax'
 });
 
-// Client is a configured Supabase Auth client with persistence and automatic
-// refresh disabled. This wrapper retains only the short-lived access token.
+// Access tokens remain in memory; the client restores the opted-in refresh session.
 function createJarvisSession({ client, now = () => Date.now() }) {
   let accessToken = null;
   let expiry = 0;
-  return {
+  const accept = ({ data, error }) => {
+    if (error || !data?.session?.access_token || !data.session.expires_at || data.user?.is_anonymous === true) throw new Error('Jarvis sign-in failed. Check your credentials.');
+    accessToken = data.session.access_token;
+    expiry = data.session.expires_at * 1000;
+  };
+  const session = {
     async signIn(email, password) {
       accessToken = null; expiry = 0;
       if (!email?.trim() || !password) throw new Error('Enter your Jarvis email and password.');
-      const { data, error } = await client.auth.signInWithPassword({ email: email.trim(), password });
-      if (error || !data?.session?.access_token || !data.session.expires_at || data.user?.is_anonymous === true) {
-        throw new Error('Jarvis sign-in failed. Check your credentials.');
+      const result = await client.auth.signInWithPassword({ email: email.trim(), password });
+      accept(result);
+      return !result.persistenceUnavailable;
+    },
+    async restore() {
+      try { accept(await client.auth.refreshSession()); return true; }
+      catch { accessToken = null; expiry = 0; return false; }
+    },
+    async ensureAccessToken() {
+      if (client.auth.sessionStillAvailable && !client.auth.sessionStillAvailable()) { accessToken = null; expiry = 0; }
+      try { return session.acquireAccessToken(); }
+      catch {
+        if (!await session.restore()) throw new Error('Sign in to Jarvis before preparing a reply.');
+        return session.acquireAccessToken();
       }
-      accessToken = data.session.access_token;
-      expiry = data.session.expires_at * 1000;
     },
     acquireAccessToken() {
       if (!accessToken || now() >= expiry - 30000) {
@@ -135,28 +149,65 @@ function createJarvisSession({ client, now = () => Date.now() }) {
       if (error) throw new Error('Local credentials cleared, but the server session could not be signed out.');
     }
   };
+  return session;
 }
 
 // Narrow use of Supabase's documented password endpoint. No signup/email APIs.
-function createPasswordClient({ url, publishableKey, fetchImpl = fetch, now = () => Date.now() }) {
+function createPasswordClient({ url, publishableKey, fetchImpl = fetch, now = () => Date.now(), storage = null, remember = () => true, withLock = work => work() }) {
   if (url !== 'https://nbhzlpelpuubosuhwifv.supabase.co' || !publishableKey?.startsWith('sb_publishable_')) throw new Error('Invalid Jarvis sign-in configuration.');
   let token = null;
+  let generation = 0;
+  let rememberedActive = false;
+  const storageKey = 'b3.jarvis.session.v1';
+  let refreshTask = null;
+  const clear = () => { token = null; rememberedActive = false; try { storage?.removeItem(storageKey); } catch {} };
+  const read = () => {
+    try {
+      const saved = JSON.parse(storage?.getItem(storageKey) || 'null');
+      if (!saved || typeof saved.refresh_token !== 'string' || !Number.isFinite(saved.saved_at) || now() - saved.saved_at >= 30 * 86400000) { clear(); return null; }
+      return saved;
+    } catch { clear(); return null; }
+  };
   const headers = { apikey: publishableKey, 'Content-Type': 'application/json' };
+  const accept = (result, savedAt = now()) => {
+    if (!result.access_token || !Number.isFinite(result.expires_in) || result.expires_in <= 0 || result.user?.is_anonymous === true) return { error: true };
+    token = result.access_token;
+    if (remember() && !storage) return { data: { user: result.user, session: { access_token: token, expires_at: Math.floor(now()/1000) + result.expires_in } }, persistenceUnavailable: true };
+    if (storage && remember() && result.refresh_token) {
+      try { storage.setItem(storageKey, JSON.stringify({ refresh_token: result.refresh_token, saved_at: savedAt })); rememberedActive = true; }
+      catch { return { data: { user: result.user, session: { access_token: token, expires_at: Math.floor(now()/1000) + result.expires_in } }, persistenceUnavailable: true }; }
+    }
+    return { data: { user: result.user, session: { access_token: token, expires_at: Math.floor(now()/1000) + result.expires_in } } };
+  };
   return { auth: {
     async signInWithPassword({ email, password }) {
-      token = null;
+      const attempt = ++generation;
+      clear();
       try {
         const response = await fetchImpl(`${url}/auth/v1/token?grant_type=password`, { method: 'POST', headers, body: JSON.stringify({ email, password }), signal: AbortSignal.timeout(15000), credentials: 'omit', cache: 'no-store' });
         if (!response.ok) return { error: true };
         const result = await response.json();
-        if (!result.access_token || !Number.isFinite(result.expires_in) || result.expires_in <= 0 || result.user?.is_anonymous === true) return { error: true };
-        token = result.access_token;
-        // Do not retain the refresh token or password.
-        return { data: { user: result.user, session: { access_token: token, expires_at: Math.floor(now()/1000) + result.expires_in } } };
+        return attempt === generation ? accept(result) : { error: true };
       } catch { return { error: true }; }
     },
+    async refreshSession() {
+      if (!refreshTask) refreshTask = withLock(async () => {
+        const attempt = generation;
+        const saved = read();
+        if (!saved) return { error: true };
+        try {
+          const response = await fetchImpl(`${url}/auth/v1/token?grant_type=refresh_token`, { method: 'POST', headers, body: JSON.stringify({ refresh_token: saved.refresh_token }), signal: AbortSignal.timeout(15000), credentials: 'omit', cache: 'no-store' });
+          if (!response.ok) { if (response.status === 400 || response.status === 401) clear(); return { error: true }; }
+          const result = await response.json();
+          return attempt === generation ? accept(result, saved.saved_at) : { error: true };
+        } catch { return { error: true }; }
+      }).finally(() => { refreshTask = null; });
+      return refreshTask;
+    },
+    sessionStillAvailable() { return Boolean(token && (!rememberedActive || read())); },
     async signOut() {
-      const previous = token; token = null;
+      generation++;
+      const previous = token; clear();
       if (!previous) return {};
       try {
         const response = await fetchImpl(`${url}/auth/v1/logout?scope=local`, { method: 'POST', headers: { ...headers, Authorization: `Bearer ${previous}` }, signal: AbortSignal.timeout(15000), credentials: 'omit', cache: 'no-store' });
@@ -178,7 +229,7 @@ async function generate(email) {
   }
   const url = new URL(config.endpoint);
   if (url.protocol !== 'https:') throw new Error('The drafting service must use HTTPS.');
-  const token = session.acquireAccessToken();
+  const token = await session.ensureAccessToken();
   if (!token) throw new Error('Sign-in is required before drafting.');
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 45000);
@@ -192,7 +243,7 @@ async function generate(email) {
   } finally { clearTimeout(timeout); }
 }
 
-Office.onReady(info => {
+Office.onReady(async info => {
   const testMode = info.host !== Office.HostType.Outlook && new URLSearchParams(location.search).get('test') === '1';
   if (info.host !== Office.HostType.Outlook && !testMode) {
     say('Sample review — no Outlook connection.');
@@ -211,7 +262,10 @@ Office.onReady(info => {
     document.querySelector('#preview').value = result.replyText;
     say('Fictional service test completed. No Outlook email was read or changed.');
   } : createDrafter({ office: Office, generate, status: say });
-  session = createJarvisSession({ client: createPasswordClient({ url: config.supabaseUrl, publishableKey: config.publishableKey }) });
+  let storage = null;
+  try { storage = localStorage; } catch {}
+  const withLock = work => navigator.locks ? navigator.locks.request('b3-jarvis-session-refresh', work) : work();
+  session = createJarvisSession({ client: createPasswordClient({ url: config.supabaseUrl, publishableKey: config.publishableKey, storage, remember: () => document.querySelector('#remember').checked, withLock }) });
   const signin = document.querySelector('#signin');
   const actions = document.querySelector('#actions');
   const draftButton = document.querySelector('#draft');
@@ -230,9 +284,9 @@ Office.onReady(info => {
     const login = document.querySelector('#login');
     login.disabled = true;
     try {
-      await session.signIn(document.querySelector('#email').value, password.value);
+      const persistenceAvailable = await session.signIn(document.querySelector('#email').value, password.value);
       signin.hidden = true; actions.hidden = false;
-      say('Ready. Click Draft reply to prepare the selected email.');
+      say(persistenceAvailable ? 'Ready. Click Draft reply to prepare the selected email.' : 'Signed in for this panel only: session storage is unavailable. Click Draft reply to continue.');
     } catch (error) { say(error.message); }
     finally { password.value = ''; login.disabled = false; }
   };
@@ -243,13 +297,17 @@ Office.onReady(info => {
   async function run() {
     retry.hidden = true;
     draftButton.disabled = true;
-    try { session.acquireAccessToken(); await draft(); }
+    try { await session.ensureAccessToken(); await draft(); }
     catch (error) { say(error.message); retry.hidden = false; }
     finally { draftButton.disabled = false; }
   }
   retry.onclick = run;
   draftButton.onclick = run;
   // Initialization, signing in and reopening the pane never trigger drafting.
+  if (await session.restore()) {
+    signin.hidden = true; actions.hidden = false;
+    say('Signed in. Click Draft reply when you want to prepare the selected email.');
+  }
 });
 
 </script>
