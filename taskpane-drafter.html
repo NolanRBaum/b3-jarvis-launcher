@@ -1,1 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Jarvis Email Drafter</title>
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <script>Office.onReady(function () {});</script>
+  <style>
+    body{margin:0;padding:24px;font:14px/1.55 'Segoe UI',sans-serif;color:#172e38;background:#f5f7f8}
+    h1{font-size:24px}.brand{font-weight:700;color:#476572}button{padding:12px 16px;border:0;border-radius:6px;background:#123f52;color:white;font-weight:600;width:100%;cursor:pointer;margin:8px 0}button:disabled{opacity:.55}#status{white-space:pre-wrap}textarea{box-sizing:border-box;width:100%;min-height:180px;margin:8px 0;padding:12px;font:inherit}label{display:block;margin:12px 0}input{box-sizing:border-box;display:block;width:100%;padding:10px;margin:4px 0;font:inherit}#sample{border-top:1px solid #ccd8dc;margin-top:24px;padding-top:16px}
+  </style>
+</head>
+<body>
+  <div class="brand">B3 · JARVIS</div>
+  <h1>Email Drafter</h1>
+  <p>Prepare a reply in Outlook for your review. Jarvis never sends it.</p>
+  <p id="status" role="status" aria-live="polite">Connecting to Outlook…</p>
+  <button id="retry" hidden>Try again</button>
+  <form id="signin" hidden>
+    <label>Email <input id="email" type="email" autocomplete="username" required></label>
+    <label>Jarvis password <input id="password" type="password" autocomplete="current-password" required></label>
+    <button id="login" type="submit">Sign in to Jarvis</button>
+  </form>
+  <section id="actions" hidden>
+    <p>Jarvis prepares only the selected email. Check that you haven't already replied or prepared a draft.</p>
+    <button id="draft" type="button">Draft reply</button>
+    <button id="signout" type="button">Sign out</button>
+  </section>
+  <section id="sample" hidden>
+    <h2>Sample review</h2>
+    <p>This uses a fictional email and a fixed sample reply. It does not call AI or access Outlook.</p>
+    <p><strong>Email:</strong> Hi Nolan, can we find a time to discuss selling my business?</p>
+    <button id="demo">Preview sample reply</button>
+    <textarea id="preview" readonly aria-label="Sample reply"></textarea>
+  </section>
+  <script type="module">
+const MAX_EMAIL_CHARS = 24000;
 
+function escapeHtml(text) {
+  return text.replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+
+function replyHtml(text) {
+  if (typeof text !== 'string' || !text.trim() || text.length > 12000) {
+    throw new Error('The drafting service returned an empty or oversized reply. No draft was opened.');
+  }
+  return text.trim().split(/\n\s*\n/).map(p => `<p>${escapeHtml(p).replace(/\n/g, '<br>')}</p>`).join('');
+}
+
+function readSelectedEmail(office) {
+  const item = office.context.mailbox.item;
+  if (!item || typeof item.displayReplyFormAsync !== 'function') {
+    throw new Error('Open a received email first. Jarvis will not overwrite a message you are composing.');
+  }
+  const id = item.itemId;
+  if (!id) throw new Error('This email has no stable identifier. Reopen it before drafting.');
+  return new Promise((resolve, reject) => item.body.getAsync(office.CoercionType.Text, result => {
+    if (result.status !== office.AsyncResultStatus.Succeeded) {
+      reject(new Error('Outlook could not read the selected email.')); return;
+    }
+    const body = result.value;
+    if (typeof body !== 'string' || !body.trim()) { reject(new Error('The selected email is empty.')); return; }
+    if (body.length > MAX_EMAIL_CHARS) {
+      reject(new Error('This email thread is too long for this review build. No text was transmitted.')); return;
+    }
+    resolve({ id, item, subject: item.subject || '', sender: item.from?.displayName || '', body });
+  }));
+}
+
+function createDrafter({ office, generate, status = () => {} }) {
+  let busy = false;
+  let completedId = null;
+  return async function draftReply() {
+    if (busy) throw new Error('A reply is already being prepared.');
+    busy = true;
+    try {
+      status('Reading the selected email…');
+      const selected = await readSelectedEmail(office);
+      if (selected.id === completedId) throw new Error('A reply was already opened for this email in this panel session.');
+      status('Preparing your reply…');
+      // Do not transmit Outlook identifiers, recipients, attachments, or mailbox credentials.
+      const draft = await generate({ subject: selected.subject, sender: selected.sender, body: selected.body });
+      if (office.context.mailbox.item.itemId !== selected.id) {
+        throw new Error('You selected a different email while the reply was being prepared. No draft was opened.');
+      }
+      const html = replyHtml(draft.replyText);
+      status('Opening your unsent reply in Outlook…');
+      await new Promise((resolve, reject) => selected.item.displayReplyFormAsync(html, result => {
+        if (result.status === office.AsyncResultStatus.Succeeded) resolve();
+        else reject(new Error('Outlook could not open the reply. No email was sent.'));
+      }));
+      completedId = selected.id;
+      status('Your unsent reply is open in Outlook. Review it before sending.');
+      return draft.replyText;
+    } finally { busy = false; }
+  };
+}
+
+// Deliberately disabled: no deployed generator or approved authentication exists yet.
+// These public settings must never contain an API key or a long-lived service token.
+const config = Object.freeze({
+  enabled: true,
+  endpoint: 'https://nbhzlpelpuubosuhwifv.supabase.co/functions/v1/jarvis-draft',
+  supabaseUrl: 'https://nbhzlpelpuubosuhwifv.supabase.co',
+  publishableKey: 'sb_publishable_-BGpcrYmK9rf4ur75FHPVA_oVhrKUax'
+});
+
+// Client is a configured Supabase Auth client with persistence and automatic
+// refresh disabled. This wrapper retains only the short-lived access token.
+function createJarvisSession({ client, now = () => Date.now() }) {
+  let accessToken = null;
+  let expiry = 0;
+  return {
+    async signIn(email, password) {
+      accessToken = null; expiry = 0;
+      if (!email?.trim() || !password) throw new Error('Enter your Jarvis email and password.');
+      const { data, error } = await client.auth.signInWithPassword({ email: email.trim(), password });
+      if (error || !data?.session?.access_token || !data.session.expires_at || data.user?.is_anonymous === true) {
+        throw new Error('Jarvis sign-in failed. Check your credentials.');
+      }
+      accessToken = data.session.access_token;
+      expiry = data.session.expires_at * 1000;
+    },
+    acquireAccessToken() {
+      if (!accessToken || now() >= expiry - 30000) {
+        accessToken = null; expiry = 0;
+        throw new Error('Sign in to Jarvis before preparing a reply.');
+      }
+      return accessToken;
+    },
+    async signOut() {
+      accessToken = null; expiry = 0;
+      const { error } = await client.auth.signOut({ scope: 'local' });
+      if (error) throw new Error('Local credentials cleared, but the server session could not be signed out.');
+    }
+  };
+}
+
+// Narrow use of Supabase's documented password endpoint. No signup/email APIs.
+function createPasswordClient({ url, publishableKey, fetchImpl = fetch, now = () => Date.now() }) {
+  if (url !== 'https://nbhzlpelpuubosuhwifv.supabase.co' || !publishableKey?.startsWith('sb_publishable_')) throw new Error('Invalid Jarvis sign-in configuration.');
+  let token = null;
+  const headers = { apikey: publishableKey, 'Content-Type': 'application/json' };
+  return { auth: {
+    async signInWithPassword({ email, password }) {
+      token = null;
+      try {
+        const response = await fetchImpl(`${url}/auth/v1/token?grant_type=password`, { method: 'POST', headers, body: JSON.stringify({ email, password }), signal: AbortSignal.timeout(15000), credentials: 'omit', cache: 'no-store' });
+        if (!response.ok) return { error: true };
+        const result = await response.json();
+        if (!result.access_token || !Number.isFinite(result.expires_in) || result.expires_in <= 0 || result.user?.is_anonymous === true) return { error: true };
+        token = result.access_token;
+        // Do not retain the refresh token or password.
+        return { data: { user: result.user, session: { access_token: token, expires_at: Math.floor(now()/1000) + result.expires_in } } };
+      } catch { return { error: true }; }
+    },
+    async signOut() {
+      const previous = token; token = null;
+      if (!previous) return {};
+      try {
+        const response = await fetchImpl(`${url}/auth/v1/logout?scope=local`, { method: 'POST', headers: { ...headers, Authorization: `Bearer ${previous}` }, signal: AbortSignal.timeout(15000), credentials: 'omit', cache: 'no-store' });
+        return response.ok ? {} : { error: true };
+      } catch { return { error: true }; }
+    }
+  } };
+}
+
+
+const status = document.querySelector('#status');
+const retry = document.querySelector('#retry');
+const say = text => { status.textContent = text; };
+let session;
+
+async function generate(email) {
+  if (!config.enabled || !config.endpoint || !session) {
+    throw new Error('This review build is not connected to an approved drafting service. No email was transmitted.');
+  }
+  const url = new URL(config.endpoint);
+  if (url.protocol !== 'https:') throw new Error('The drafting service must use HTTPS.');
+  const token = session.acquireAccessToken();
+  if (!token) throw new Error('Sign-in is required before drafting.');
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 45000);
+  try {
+    const response = await fetch(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, apikey: config.publishableKey },
+      body: JSON.stringify(email), signal: controller.signal, credentials: 'omit', cache: 'no-store'
+    });
+    if (!response.ok) throw new Error('The drafting service could not prepare a reply. No draft was opened.');
+    return await response.json();
+  } finally { clearTimeout(timeout); }
+}
+
+Office.onReady(info => {
+  const testMode = info.host !== Office.HostType.Outlook && new URLSearchParams(location.search).get('test') === '1';
+  if (info.host !== Office.HostType.Outlook && !testMode) {
+    say('Sample review — no Outlook connection.');
+    document.querySelector('#sample').hidden = false;
+    document.querySelector('#demo').onclick = () => {
+      document.querySelector('#preview').value = 'Thanks for reaching out. I’d be happy to learn more about your business and what you’re considering. What times work for a brief conversation?';
+    };
+    return;
+  }
+  if (!config.enabled) { say('Review build: the drafting service is not connected. No email has been read or transmitted.'); return; }
+  if (!testMode && !Office.context.requirements.isSetSupported('Mailbox', '1.9')) {
+    say('This Outlook version does not support opening a prepared reply.'); return;
+  }
+  const draft = testMode ? async () => {
+    const result = await generate({ subject: 'Fictional business inquiry', sender: 'Example Sender', body: 'Hi Nolan, I am considering selling a fictional business. What is the first step?' });
+    document.querySelector('#preview').value = result.replyText;
+    say('Fictional service test completed. No Outlook email was read or changed.');
+  } : createDrafter({ office: Office, generate, status: say });
+  session = createJarvisSession({ client: createPasswordClient({ url: config.supabaseUrl, publishableKey: config.publishableKey }) });
+  const signin = document.querySelector('#signin');
+  const actions = document.querySelector('#actions');
+  const draftButton = document.querySelector('#draft');
+  if (testMode) {
+    document.querySelector('#sample').hidden = false;
+    document.querySelector('#sample p').textContent = 'This calls the drafting service with a fictional inquiry only. It does not access Outlook.';
+    document.querySelector('#demo').hidden = true;
+    document.querySelector('#actions p').textContent = 'Test the service using a fixed fictional email.';
+    draftButton.textContent = 'Test with fictional email';
+  }
+  signin.hidden = false;
+  say('Sign in to Jarvis. No email is read until you click Draft reply.');
+  signin.onsubmit = async event => {
+    event.preventDefault();
+    const password = document.querySelector('#password');
+    const login = document.querySelector('#login');
+    login.disabled = true;
+    try {
+      await session.signIn(document.querySelector('#email').value, password.value);
+      signin.hidden = true; actions.hidden = false;
+      say('Ready. Click Draft reply to prepare the selected email.');
+    } catch (error) { say(error.message); }
+    finally { password.value = ''; login.disabled = false; }
+  };
+  document.querySelector('#signout').onclick = async () => {
+    try { await session.signOut(); say('Signed out.'); } catch (error) { say(error.message); }
+    actions.hidden = true; signin.hidden = false;
+  };
+  async function run() {
+    retry.hidden = true;
+    draftButton.disabled = true;
+    try { session.acquireAccessToken(); await draft(); }
+    catch (error) { say(error.message); retry.hidden = false; }
+    finally { draftButton.disabled = false; }
+  }
+  retry.onclick = run;
+  draftButton.onclick = run;
+  // Initialization, signing in and reopening the pane never trigger drafting.
+});
+
+</script>
+</body>
+</html>
